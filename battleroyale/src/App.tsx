@@ -34,7 +34,7 @@ function shortAddr(a: string) {
 }
 
 /** Burner wallet infra: persist private key locally so refresh keeps identity */
-function loadOrCreateBurner(): ethers.Wallet {
+function loadOrCreateBurner(): ethers.Wallet | ethers.HDNodeWallet {
   const key = "arena_burner_pk";
   const pk = localStorage.getItem(key);
   if (pk && pk.startsWith("0x") && pk.length === 66) {
@@ -52,12 +52,12 @@ export default function App() {
   const burner = useMemo(() => loadOrCreateBurner(), []);
   // Later you’ll connect burner to a provider or just sign typed data locally.
 
-  async function signIntent(payload: object) {
-    // Placeholder signing scheme for later onchain/relayer:
-    // Keep it simple now: sign a JSON string. Later: switch to EIP-712.
-    const msg = JSON.stringify(payload);
-    return burner.signMessage(msg);
-  }
+  // async function signIntent(payload: object) {
+  //   // Placeholder signing scheme for later onchain/relayer:
+  //   // Keep it simple now: sign a JSON string. Later: switch to EIP-712.
+  //   const msg = JSON.stringify(payload);
+  //   return burner.signMessage(msg);
+  // }
 
   // --- canvas sizing ---
   const containerRef = useRef<HTMLDivElement | null>(null);
