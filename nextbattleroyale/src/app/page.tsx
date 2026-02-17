@@ -1,4 +1,6 @@
 "use client";
+
+import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ethers } from "ethers";
 
@@ -11,6 +13,9 @@ type KillFeedItem = { text: string; ts: number };
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
+
+const moveInFlightRef = useRef(false);
+const pendingDirRef = useRef<0|1|2|3 | null>(null);
 
 function useIsCoarsePointer() {
   const [coarse, setCoarse] = useState(false);
@@ -36,39 +41,121 @@ function shortAddr(a: string) {
 
 /** Burner wallet infra: persist private key locally so refresh keeps identity */
 function loadOrCreateBurner(): ethers.Wallet | ethers.HDNodeWallet {
-  // Only run in browser
-  if (typeof window === "undefined") {
-    return ethers.Wallet.createRandom();
-  }
-  
+  if (typeof window === "undefined") return ethers.Wallet.createRandom();
   const key = "arena_burner_pk";
   const pk = localStorage.getItem(key);
-  if (pk && pk.startsWith("0x") && pk.length === 66) {
-    return new ethers.Wallet(pk);
-  }
+  if (pk && pk.startsWith("0x") && pk.length === 66) return new ethers.Wallet(pk);
   const w = ethers.Wallet.createRandom();
   localStorage.setItem(key, w.privateKey);
   return w;
 }
 
+// -------------------- Arena ABI (events + nonce read) --------------------
+const ARENA_ABI = [
+  "function nonces(address) view returns (uint256)",
+  "event NameSet(address indexed player, bytes12 name)",
+  "event Joined(address indexed player, uint8 x, uint8 y, bytes12 name)",
+  "event Moved(address indexed player, uint8 fromX, uint8 fromY, uint8 toX, uint8 toY)",
+  "event Killed(address indexed killer, address indexed victim, uint32 killerScore, bytes12 killerName, bytes12 victimName)",
+  "event Respawned(address indexed player, uint8 x, uint8 y, uint32 score)",
+] as const;
+
+const arenaIface = new ethers.Interface(ARENA_ABI);
+
+function bytes12ToString(b12: string): string {
+  const raw = ethers.getBytes(b12);
+  let end = raw.length;
+  while (end > 0 && raw[end - 1] === 0) end--;
+  return ethers.toUtf8String(raw.slice(0, end));
+}
+
+function toBytes12FromName(name: string): string {
+  const trimmed = (name ?? "").trim().slice(0, 12);
+  const bytes = ethers.toUtf8Bytes(trimmed);
+  const sliced = bytes.length > 12 ? bytes.slice(0, 12) : bytes;
+  const padded = ethers.zeroPadBytes(sliced, 12);
+  return ethers.hexlify(padded); // 0x + 24 hex chars
+}
+
+enum ActionType {
+  SET_NAME = 0,
+  JOIN = 1,
+  MOVE = 2,
+}
+
+function commonDomain(chainId: bigint, arenaAddress: string): string {
+  return ethers.keccak256(
+    ethers.solidityPacked(["uint256", "address"], [chainId, arenaAddress as `0x${string}`])
+  );
+}
+
+function digestJoin(params: {
+  chainId: bigint;
+  arenaAddress: string;
+  player: string;
+  nonce: bigint;
+  deadline: bigint;
+}): string {
+  const domain = commonDomain(params.chainId, params.arenaAddress);
+  return ethers.keccak256(
+    ethers.solidityPacked(
+      ["bytes32", "uint8", "address", "uint256", "uint256"],
+      [domain, ActionType.JOIN, params.player as `0x${string}`, params.nonce, params.deadline]
+    )
+  );
+}
+
+function digestMove(params: {
+  chainId: bigint;
+  arenaAddress: string;
+  player: string;
+  dir: number;
+  nonce: bigint;
+  deadline: bigint;
+}): string {
+  const domain = commonDomain(params.chainId, params.arenaAddress);
+  return ethers.keccak256(
+    ethers.solidityPacked(
+      ["bytes32", "uint8", "address", "uint8", "uint256", "uint256"],
+      [domain, ActionType.MOVE, params.player as `0x${string}`, params.dir, params.nonce, params.deadline]
+    )
+  );
+}
+
+function digestSetName(params: {
+  chainId: bigint;
+  arenaAddress: string;
+  player: string;
+  nameBytes12: string;
+  nonce: bigint;
+  deadline: bigint;
+}): string {
+  const domain = commonDomain(params.chainId, params.arenaAddress);
+  return ethers.keccak256(
+    ethers.solidityPacked(
+      ["bytes32", "uint8", "address", "bytes12", "uint256", "uint256"],
+      [
+        domain,
+        ActionType.SET_NAME,
+        params.player as `0x${string}`,
+        params.nameBytes12 as `0x${string}`,
+        params.nonce,
+        params.deadline,
+      ]
+    )
+  );
+}
+
+// ------------------------------------------------------------------------
+
 export default function App() {
   const coarse = useIsCoarsePointer();
 
-  // ----- Burner wallet (infra only, not used for WS auth yet) -----
+  // ----- Burner wallet -----
   const [burner, setBurner] = useState<ethers.Wallet | ethers.HDNodeWallet | null>(null);
-  
   useEffect(() => {
-    // Initialize burner wallet only on client side
     setBurner(loadOrCreateBurner());
   }, []);
-  // Later you’ll connect burner to a provider or just sign typed data locally.
-
-  // async function signIntent(payload: object) {
-  //   // Placeholder signing scheme for later onchain/relayer:
-  //   // Keep it simple now: sign a JSON string. Later: switch to EIP-712.
-  //   const msg = JSON.stringify(payload);
-  //   return burner.signMessage(msg);
-  // }
 
   // --- canvas sizing ---
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -95,7 +182,7 @@ export default function App() {
 
   const arenaPx = useMemo(() => MAP_SIZE * tile, [tile]);
 
-  // --- authoritative state (WS today; chain events later) ---
+  // --- authoritative state (now: chain events over RPC WS) ---
   const playersRef = useRef<Map<PlayerId, Player>>(new Map());
 
   // --- UI snapshots ---
@@ -110,8 +197,7 @@ export default function App() {
   const [nameInput, setNameInput] = useState<string>("");
   const [hasSetName, setHasSetName] = useState<boolean>(false);
   const [showNameModal, setShowNameModal] = useState<boolean>(false);
-  
-  // Initialize name state from localStorage on client side
+
   useEffect(() => {
     const stored = localStorage.getItem("arena_name") ?? "";
     setNameInput(stored);
@@ -120,16 +206,11 @@ export default function App() {
     setShowNameModal(!hasName);
   }, []);
 
-  // --- event handlers (keep these when swapping to onchain) ---
+  // --- event handlers (same shape as before) ---
   function onPlayerUpsert(id: PlayerId, player: Player) {
     playersRef.current.set(id, player);
     setPlayerCount(playersRef.current.size);
-    if (myId && id === myId) setMyScore(player.score);
-  }
-
-  function onPlayerLeft(id: PlayerId) {
-    playersRef.current.delete(id);
-    setPlayerCount(playersRef.current.size);
+    if (myId && id.toLowerCase() === myId.toLowerCase()) setMyScore(player.score);
   }
 
   function onPlayerMoved(id: PlayerId, pos: { x: number; y: number }) {
@@ -150,123 +231,267 @@ export default function App() {
     const p = playersRef.current.get(id);
     if (!p) return;
     p.score = score;
-    if (myId && id === myId) setMyScore(score);
+    if (myId && id.toLowerCase() === myId.toLowerCase()) setMyScore(score);
   }
 
   function onKillFeedLine(text: string) {
-    setKillFeed((prev) => {
-      const next = [{ text, ts: Date.now() }, ...prev];
-      return next.slice(0, 10);
-    });
+    setKillFeed((prev) => [{ text, ts: Date.now() }, ...prev].slice(0, 10));
   }
 
-  // --- WS transport ---
-  const wsRef = useRef<WebSocket | null>(null);
+  // --- Chain connection (WS provider) ---
+  const providerRef = useRef<ethers.WebSocketProvider | null>(null);
+  const arenaRef = useRef<ethers.Contract | null>(null);
+  const chainIdRef = useRef<bigint | null>(null);
 
+  const arenaAddress = useMemo(() => process.env.NEXT_PUBLIC_ARENA_ADDRESS || "", []);
+  const rpcWsUrl = useMemo(() => process.env.NEXT_PUBLIC_RPC_WS_URL || "", []);
+
+  // Subscribe to contract events (replaces local ws server)
   useEffect(() => {
-    const wsUrl =
-      new URLSearchParams(window.location.search).get("ws") ||
-      `ws://${window.location.hostname}:8787`;
+    if (!arenaAddress || !rpcWsUrl) {
+      setStatus("Missing NEXT_PUBLIC_ARENA_ADDRESS or NEXT_PUBLIC_RPC_WS_URL");
+      return;
+    }
+    if (!burner) return;
 
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    setMyId(burner.address);
+    setStatus("Connecting to chain…");
 
-    ws.onopen = () => setStatus(`Connected: ${wsUrl}`);
-    ws.onerror = () => setStatus(`WS error (is server running?)`);
-    ws.onclose = () => setStatus(`Disconnected`);
+    const provider = new ethers.WebSocketProvider(rpcWsUrl);
+    providerRef.current = provider;
 
-    ws.onmessage = (ev) => {
-      let msg: any;
+    const arena = new ethers.Contract(arenaAddress, ARENA_ABI, provider);
+    arenaRef.current = arena;
+
+    let alive = true;
+
+    (async () => {
       try {
-        msg = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
+        const net = await provider.getNetwork();
+        chainIdRef.current = net.chainId;
 
-      if (msg.type === "welcome") {
-        setMyId(msg.id);
+        if (!alive) return;
 
-        const map = new Map<PlayerId, Player>();
-        for (const [id, player] of Object.entries(msg.players as Record<string, Player>)) {
-          map.set(id, player);
-        }
-        playersRef.current = map;
-        setPlayerCount(map.size);
-        setMyScore(map.get(msg.id)?.score ?? 0);
-        setStatus(`Connected: ${wsUrl} · You are ${msg.id} (red) · Burner: ${burner ? shortAddr(burner.address) : "..."}`);
+        setStatus(
+          `Connected: chainId ${net.chainId.toString()} · Arena ${shortAddr(arenaAddress)} · You ${shortAddr(
+            burner.address
+          )}`
+        );
 
-        // If name already stored, immediately set it on server
-        const stored = typeof window !== "undefined" ? sanitizeName(localStorage.getItem("arena_name") ?? "") : "";
+        // If name already stored, set it onchain via relayer, then join (idempotent)
+        const stored = sanitizeName(localStorage.getItem("arena_name") ?? "");
         if (stored) {
-          requestSetName(stored);
+          await requestSetName(stored);
           setHasSetName(true);
           setShowNameModal(false);
         }
-        return;
+        await requestJoin();
+      } catch (e: any) {
+        setStatus(`RPC WS error: ${e?.message || String(e)}`);
       }
+    })();
 
-      if (msg.type === "player_joined") {
-        onPlayerUpsert(msg.id, msg.player);
-        return;
-      }
+    const filter = { address: arenaAddress as `0x${string}` };
 
-      if (msg.type === "player_left") {
-        onPlayerLeft(msg.id);
-        return;
-      }
+    const onLog = (log: ethers.Log) => {
+      console.log("got log", log);
+      try {
+        const parsed = arenaIface.parseLog(log);
+        if (!parsed) return;
 
-      if (msg.type === "player_moved") {
-        onPlayerMoved(msg.id, msg.pos);
-        return;
-      }
+        const ev = parsed.name;
+        const args: any = parsed.args;
 
-      if (msg.type === "player_named") {
-        onPlayerNamed(msg.id, msg.name);
-        return;
-      }
+        if (ev === "Joined") {
+          const id = (args.player as string).toLowerCase();
+          const x = Number(args.x);
+          const y = Number(args.y);
+          const name = bytes12ToString(args.name);
+          onPlayerUpsert(id, { x, y, alive: true, score: 0, name });
+          return;
+        }
 
-      if (msg.type === "player_score") {
-        onPlayerScore(msg.id, msg.score);
-        return;
-      }
+        if (ev === "NameSet") {
+          const id = (args.player as string).toLowerCase();
+          const nm = bytes12ToString(args.name);
+          // ensure player exists in map
+          if (!playersRef.current.has(id)) {
+            onPlayerUpsert(id, { x: 0, y: 0, alive: true, score: 0, name: nm });
+          } else {
+            onPlayerNamed(id, nm);
+          }
+          return;
+        }
 
-      if (msg.type === "kill_feed") {
-        const line = `${msg.killerName} killed ${msg.victimName} (+1)`;
-        onKillFeedLine(line);
-        onPlayerScore(msg.killer, msg.killerScore);
-        return;
-      }
+        if (ev === "Moved") {
+          const id = (args.player as string).toLowerCase();
+          const toX = Number(args.toX);
+          const toY = Number(args.toY);
 
-      if (msg.type === "player_respawned") {
-        onPlayerUpsert(msg.id, msg.player);
-        return;
+          if (!playersRef.current.has(id)) {
+            onPlayerUpsert(id, { x: toX, y: toY, alive: true, score: 0, name: "" });
+          } else {
+            onPlayerMoved(id, { x: toX, y: toY });
+          }
+          return;
+        }
+
+        if (ev === "Killed") {
+          const killer = (args.killer as string).toLowerCase();
+          const victim = (args.victim as string).toLowerCase();
+          const killerScore = Number(args.killerScore);
+          const killerName = bytes12ToString(args.killerName);
+          const victimName = bytes12ToString(args.victimName);
+
+          // Update killer score + name
+          if (!playersRef.current.has(killer)) {
+            onPlayerUpsert(killer, { x: 0, y: 0, alive: true, score: killerScore, name: killerName });
+          } else {
+            if (killerName) onPlayerNamed(killer, killerName);
+            onPlayerScore(killer, killerScore);
+          }
+
+          // Victim score resets; respawn event will update location
+          if (playersRef.current.has(victim)) {
+            onPlayerScore(victim, 0);
+          }
+
+          onKillFeedLine(`${killerName || shortAddr(killer)} killed ${victimName || shortAddr(victim)} (+1)`);
+          return;
+        }
+
+        if (ev === "Respawned") {
+          const id = (args.player as string).toLowerCase();
+          const x = Number(args.x);
+          const y = Number(args.y);
+          const score = Number(args.score);
+          const existing = playersRef.current.get(id);
+
+          onPlayerUpsert(id, {
+            x,
+            y,
+            alive: true,
+            score,
+            name: existing?.name ?? "",
+          });
+          return;
+        }
+      } catch {
+        // ignore
       }
     };
+
+    provider.on(filter, onLog);
 
     return () => {
+      alive = false;
       try {
-        ws.close();
+        provider.off(filter, onLog);
       } catch {}
+      try {
+        provider.destroy();
+      } catch {}
+      providerRef.current = null;
+      arenaRef.current = null;
+      chainIdRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [burner?.address]);
+  }, [burner?.address, arenaAddress, rpcWsUrl]);
 
-  // --- intent functions (later become tx submission) ---
-  function requestMove(dir: 0 | 1 | 2 | 3) {
-    if (!hasSetName) return; // gate playing
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    // Later: use burner signatures and relay/onchain.
-    // For now: plain WS message.
-    ws.send(JSON.stringify({ type: "move", dir }));
+  // --- Relayer intent submission (POST /api/*) ---
+  async function getNonce(player: string): Promise<bigint> {
+    const arena = arenaRef.current;
+    if (!arena) throw new Error("Arena not ready");
+    return (await arena.nonces(player)) as bigint;
   }
 
-  function requestSetName(name: string) {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "set_name", name }));
+  async function signDigest(digest: string): Promise<string> {
+    if (!burner) throw new Error("Burner not ready");
+    return burner.signMessage(ethers.getBytes(digest));
   }
+
+  async function requestJoin() {
+    if (!burner) return;
+    const chainId = chainIdRef.current;
+    if (!chainId) return;
+
+    const player = burner.address;
+    const nonce = await getNonce(player);
+    const deadline = BigInt(0);
+
+    const dig = digestJoin({ chainId, arenaAddress, player, nonce, deadline });
+    const sig = await signDigest(dig);
+
+    await fetch("/api/join", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ player, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
+    }).catch(() => {});
+  }
+
+  async function requestSetName(name: string) {
+    if (!burner) return;
+    const chainId = chainIdRef.current;
+    if (!chainId) return;
+
+    const player = burner.address;
+    const nonce = await getNonce(player);
+    const deadline = BigInt(0);
+
+    const nameBytes12 = toBytes12FromName(name);
+    const dig = digestSetName({ chainId, arenaAddress, player, nameBytes12, nonce, deadline });
+    const sig = await signDigest(dig);
+
+    await fetch("/api/set-name", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ player, name, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
+    }).catch(() => {});
+  }
+
+ async function requestMove(dir: 0 | 1 | 2 | 3) {
+  if (!hasSetName) return;
+  if (!burner) return;
+
+  // coalesce spam: keep only latest direction
+  pendingDirRef.current = dir;
+
+  // if a move is already being sent, just wait — latest dir will be sent next
+  if (moveInFlightRef.current) return;
+
+  moveInFlightRef.current = true;
+  try {
+    while (pendingDirRef.current !== null) {
+      const d = pendingDirRef.current;
+      pendingDirRef.current = null;
+
+      const chainId = chainIdRef.current;
+      if (!chainId) return;
+
+      const player = burner.address;
+      const nonce = await getNonce(player);
+      const deadline = BigInt(0);
+
+      const dig = digestMove({ chainId, arenaAddress, player, dir: d, nonce, deadline });
+      const sig = await signDigest(dig);
+
+      const res = await fetch("/api/move", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ player, dir: d, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
+      });
+
+      // if relayer rejected, stop the loop (prevents infinite retries)
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        console.warn("move rejected", j);
+        return;
+      }
+    }
+  } finally {
+    moveInFlightRef.current = false;
+  }
+}
 
   // keyboard support
   useEffect(() => {
@@ -317,7 +542,7 @@ export default function App() {
         .sort((a, b) => b.score - a.score)
         .slice(0, 8);
       setLeaderboard(arr);
-      if (myId) setMyScore(playersRef.current.get(myId)?.score ?? 0);
+      if (myId) setMyScore(playersRef.current.get(myId.toLowerCase())?.score ?? 0);
     }, 250);
     return () => window.clearInterval(t);
   }, [myId]);
@@ -365,11 +590,11 @@ export default function App() {
       }
       ctx.globalAlpha = 1;
 
-      const me = myId?.toLowerCase();
+      const me = burner?.address?.toLowerCase();
       const players = playersRef.current;
 
       for (const [id, p] of players.entries()) {
-        if (!p.alive) continue; // server currently instant respawns anyway
+        if (!p.alive) continue;
         const cx = p.x * t + t / 2;
         const cy = p.y * t + t / 2;
         const r = Math.max(2, t * 0.32);
@@ -377,7 +602,6 @@ export default function App() {
         const isMe = me && id.toLowerCase() === me;
 
         if (isMe) {
-          // RED for current player
           ctx.beginPath();
           ctx.arc(cx, cy, r * 2.3, 0, Math.PI * 2);
           ctx.fillStyle = "rgba(255,80,80,0.22)";
@@ -393,7 +617,6 @@ export default function App() {
           ctx.strokeStyle = "rgba(255,255,255,0.70)";
           ctx.stroke();
         } else {
-          // default dot style
           ctx.beginPath();
           ctx.arc(cx, cy, r * 2.3, 0, Math.PI * 2);
           ctx.fillStyle = "rgba(120,180,255,0.20)";
@@ -419,7 +642,7 @@ export default function App() {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [tile, myId]);
+  }, [tile, burner?.address]);
 
   // ----- Name modal submit -----
   const submitName = async () => {
@@ -429,15 +652,12 @@ export default function App() {
     localStorage.setItem("arena_name", name);
     setHasSetName(true);
     setShowNameModal(false);
-    requestSetName(name);
 
-    // “infra”: example of signing something with burner (not used yet)
-    // Useful for your future relay:
-    // const sig = await signIntent({ action: "set_name", name, ts: Date.now() });
-    // console.log("burner signature example:", sig);
+    await requestSetName(name);
+    await requestJoin(); // safe/idempotent
   };
 
-  // block page scroll while modal open (optional but nice on mobile)
+  // block page scroll while modal open
   useEffect(() => {
     if (!showNameModal) return;
     const prev = document.body.style.overflow;
@@ -479,7 +699,8 @@ export default function App() {
               </button>
 
               <div style={{ opacity: 0.6, fontSize: 12 }}>
-                Burner wallet: <span className="kbd">{burner ? shortAddr(burner.address) : "..."}</span> (auto-created on this device)
+                Burner wallet: <span className="kbd">{burner ? shortAddr(burner.address) : "..."}</span> (auto-created on
+                this device)
               </div>
             </div>
           </div>
@@ -497,6 +718,10 @@ export default function App() {
             Name: <span className="kbd">{nameInput ? sanitizeName(nameInput) : "—"}</span> · Burner:{" "}
             <span className="kbd">{burner ? shortAddr(burner.address) : "..."}</span>
           </div>
+          <div style={{ opacity: 0.7, marginTop: 6, fontSize: 13 }}>
+            Chain WS: <span className="kbd">{rpcWsUrl ? rpcWsUrl : "—"}</span> · Arena:{" "}
+            <span className="kbd">{arenaAddress ? shortAddr(arenaAddress) : "—"}</span>
+          </div>
         </div>
 
         <div style={{ width: 320, display: "grid", gap: 12 }}>
@@ -505,8 +730,15 @@ export default function App() {
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {leaderboard.map((e) => (
                 <div key={e.id} style={{ display: "flex", justifyContent: "space-between", opacity: 0.9 }}>
-                  <span style={{ color: myId === e.id ? "rgba(255,120,120,0.95)" : "rgba(180,220,255,0.92)" }}>
-                    {myId === e.id ? "YOU" : e.name}
+                  <span
+                    style={{
+                      color:
+                        burner && burner.address.toLowerCase() === e.id.toLowerCase()
+                          ? "rgba(255,120,120,0.95)"
+                          : "rgba(180,220,255,0.92)",
+                    }}
+                  >
+                    {burner && burner.address.toLowerCase() === e.id.toLowerCase() ? "YOU" : e.name}
                   </span>
                   <span className="kbd">{e.score}</span>
                 </div>
@@ -585,6 +817,7 @@ export default function App() {
   );
 }
 
+// -------------------- styles --------------------
 const panelStyle: React.CSSProperties = {
   background: "rgba(255,255,255,0.04)",
   border: "1px solid rgba(255,255,255,0.12)",
