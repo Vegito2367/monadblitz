@@ -6,12 +6,14 @@ export const ARENA_ABI = [
   "function joinFor(address player,uint256 nonce,uint256 deadline,bytes sig)",
   "function moveFor(address player,uint8 dir,uint256 nonce,uint256 deadline,bytes sig)",
   "function setNameFor(address player,bytes12 newName,uint256 nonce,uint256 deadline,bytes sig)",
+  "function kickInactive(address player)",
 
   "event NameSet(address indexed player, bytes12 name)",
   "event Joined(address indexed player, uint8 x, uint8 y, bytes12 name)",
   "event Moved(address indexed player, uint8 fromX, uint8 fromY, uint8 toX, uint8 toY)",
   "event Killed(address indexed killer, address indexed victim, uint32 killerScore, bytes12 killerName, bytes12 victimName)",
   "event Respawned(address indexed player, uint8 x, uint8 y, uint32 score)",
+  "event Kicked(address indexed player, uint8 x, uint8 y, bytes12 name, uint256 lastActiveAt)"
 ] as const;
 
 export const arenaIface = new ethers.Interface(ARENA_ABI);

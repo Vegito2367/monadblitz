@@ -32,6 +32,9 @@ contract Arena {
     // replay protection for meta-tx
     mapping(address => uint256) public nonces;
 
+    mapping(address => uint256) public lastActiveAt;
+uint256 public constant INACTIVITY_TIMEOUT = 15;
+
     // ---------- Events ----------
     event NameSet(address indexed player, bytes12 name);
 
@@ -55,6 +58,8 @@ contract Arena {
 
     event Respawned(address indexed player, uint8 x, uint8 y, uint32 score);
 
+    event Kicked(address indexed player, uint8 x, uint8 y, bytes12 name, uint256 lastActiveAt);
+
     // ---------- Errors ----------
     error BadSig();
     error Expired();
@@ -62,6 +67,8 @@ contract Arena {
     error NotJoined();
     error InvalidDir();
     error NameEmpty();
+    error NotInactive();
+    error NotActive();
 
     // ---------- Intent Types ----------
     // We'll use EIP-191 style hashing first (simple), then upgrade to EIP-712 if you want.
@@ -87,8 +94,9 @@ contract Arena {
 
         bytes32 digest = _digestSetName(player, newName, nonce, deadline);
         _verify(player, digest, sig);
-
+        
         nameOf[player] = newName;
+        lastActiveAt[player] = block.timestamp;
         emit NameSet(player, newName);
     }
 
@@ -103,7 +111,7 @@ contract Arena {
 
         bytes32 digest = _digestJoin(player, nonce, deadline);
         _verify(player, digest, sig);
-
+        lastActiveAt[player] = block.timestamp;
         _joinIfNeeded(player);
     }
 
@@ -119,7 +127,7 @@ contract Arena {
 
         bytes32 digest = _digestMove(player, dir, nonce, deadline);
         _verify(player, digest, sig);
-
+lastActiveAt[player] = block.timestamp;
         _move(player, dir);
     }
 
@@ -135,7 +143,7 @@ contract Arena {
             p.joined = true;
 
             tileOccupant[_tileId(sx, sy)] = player;
-
+            lastActiveAt[player] = block.timestamp;
             emit Joined(player, sx, sy, nameOf[player]);
         }
         // if already joined: no-op (idempotent)
@@ -169,6 +177,7 @@ contract Arena {
 
             // victim must have joined to exist; if not, treat as empty
             if (v.joined) {
+                lastActiveAt[player] = block.timestamp;
                 me.score += 1;
 
                 // clear victim tile
@@ -318,4 +327,31 @@ contract Arena {
             deadline
         ));
     }
+
+    function kickInactive(address player) external {
+    Player storage p = players[player];
+    if (!p.joined) revert NotActive();
+
+    uint256 last = lastActiveAt[player];
+    if (block.timestamp <= last + INACTIVITY_TIMEOUT) revert NotInactive();
+
+    uint8 x = p.x;
+    uint8 y = p.y;
+
+    // clear occupancy if they still occupy their recorded tile
+    uint16 tile = _tileId(x, y);
+    if (tileOccupant[tile] == player) {
+        tileOccupant[tile] = address(0);
+    }
+
+    bytes12 nm = nameOf[player];
+
+    // wipe state so they can't "resume"
+    p.score = 0;
+    p.joined = false;
+    nameOf[player] = bytes12(0);
+    lastActiveAt[player] = 0;
+
+    emit Kicked(player, x, y, nm, last);
+}
 }

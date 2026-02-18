@@ -449,6 +449,80 @@ function _applyDirPure(uint8 x, uint8 y, uint8 dir) internal pure returns (uint8
     }
 }
 
+function _setNameMeta(address player, uint256 pk, bytes12 name) internal {
+    uint256 nonce = arena.nonces(player);
+    uint256 deadline = block.timestamp + 60;
+    bytes32 d = _digestSetName(player, name, nonce, deadline);
+    bytes memory sig = _sign(pk, d);
+    vm.prank(relayer);
+    arena.setNameFor(player, name, nonce, deadline, sig);
+}
+
+function _joinMeta(address player, uint256 pk) internal {
+    uint256 nonce = arena.nonces(player);
+    uint256 deadline = block.timestamp + 60;
+    bytes32 d = _digestJoin(player, nonce, deadline);
+    bytes memory sig = _sign(pk, d);
+    vm.prank(relayer);
+    arena.joinFor(player, nonce, deadline, sig);
+}
+
+function test_kickInactive_reverts_if_not_active() public {
+    vm.expectRevert(Arena.NotActive.selector);
+    arena.kickInactive(A);
+}
+
+function test_kickInactive_reverts_if_not_inactive_yet() public {
+    _joinMeta(A, pkA);
+
+    // Immediately trying to kick should revert
+    vm.expectRevert(Arena.NotInactive.selector);
+    arena.kickInactive(A);
+}
+
+function test_kickInactive_after_timeout_clears_tile_and_allows_rejoin() public {
+    // Give A a name + join
+    _setNameMeta(A, pkA, bytes12("TEJ"));
+    _joinMeta(A, pkA);
+
+    (uint8 x, uint8 y, uint32 score, bool joined) = arena.players(A);
+    assertTrue(joined);
+    assertEq(score, 0);
+
+    uint16 tid = _tileId(x, y);
+    assertEq(arena.tileOccupant(tid), A);
+    assertEq(arena.nameOf(A), bytes12("TEJ"));
+
+    // Warp past 15s timeout (use 16s to be safe)
+    vm.warp(block.timestamp + 16);
+
+    // Expect Kicked event (light check is OK; we’ll check key fields)
+    vm.expectEmit(true, false, false, true, address(arena));
+    emit Arena.Kicked(A, x, y, bytes12("TEJ"), arena.lastActiveAt(A));
+
+    // Kick
+    arena.kickInactive(A);
+
+    // Player should be removed/reset
+    (uint8 x2, uint8 y2, uint32 score2, bool joined2) = arena.players(A);
+    assertFalse(joined2);
+    assertEq(score2, 0);
+
+    // Occupancy cleared (tile may be cleared only if it matched)
+    assertEq(arena.tileOccupant(tid), address(0));
+
+    // Name cleared (so no resume)
+    assertEq(arena.nameOf(A), bytes12(0));
+
+    // Rejoin should work and should not "resume"
+    _joinMeta(A, pkA);
+    (uint8 x3, uint8 y3, uint32 score3, bool joined3) = arena.players(A);
+    assertTrue(joined3);
+    assertEq(score3, 0);
+
+    uint16 tid3 = _tileId(x3, y3);
+    assertEq(arena.tileOccupant(tid3), A);
+}
 
 
 }

@@ -8,14 +8,12 @@ const MAP_SIZE = 64;
 
 type PlayerId = string;
 type Player = { x: number; y: number; alive: boolean; score: number; name: string };
-type KillFeedItem = { text: string; ts: number };
+type KillFeedItem = { id: string; text: string; ts: number };
 
 function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n));
 }
 
-const moveInFlightRef = useRef(false);
-const pendingDirRef = useRef<0|1|2|3 | null>(null);
 
 function useIsCoarsePointer() {
   const [coarse, setCoarse] = useState(false);
@@ -41,12 +39,19 @@ function shortAddr(a: string) {
 
 /** Burner wallet infra: persist private key locally so refresh keeps identity */
 function loadOrCreateBurner(): ethers.Wallet | ethers.HDNodeWallet {
-  if (typeof window === "undefined") return ethers.Wallet.createRandom();
+  if (typeof window === "undefined") {
+    return ethers.Wallet.createRandom();
+  }
+
   const key = "arena_burner_pk";
-  const pk = localStorage.getItem(key);
-  if (pk && pk.startsWith("0x") && pk.length === 66) return new ethers.Wallet(pk);
+  const pk = sessionStorage.getItem(key);
+
+  if (pk && pk.startsWith("0x") && pk.length === 66) {
+    return new ethers.Wallet(pk);
+  }
+
   const w = ethers.Wallet.createRandom();
-  localStorage.setItem(key, w.privateKey);
+  sessionStorage.setItem(key, w.privateKey);
   return w;
 }
 
@@ -58,6 +63,7 @@ const ARENA_ABI = [
   "event Moved(address indexed player, uint8 fromX, uint8 fromY, uint8 toX, uint8 toY)",
   "event Killed(address indexed killer, address indexed victim, uint32 killerScore, bytes12 killerName, bytes12 victimName)",
   "event Respawned(address indexed player, uint8 x, uint8 y, uint32 score)",
+  "event Kicked(address indexed player, uint8 x, uint8 y, bytes12 name, uint256 lastActiveAt)",
 ] as const;
 
 const arenaIface = new ethers.Interface(ARENA_ABI);
@@ -150,7 +156,13 @@ function digestSetName(params: {
 
 export default function App() {
   const coarse = useIsCoarsePointer();
+  const moveInFlightRef = useRef(false);
+  const pendingDirRef = useRef<0 | 1 | 2 | 3 | null>(null);
 
+  const lastSeenRef = useRef<Map<string, number>>(new Map());
+  const kickInFlightRef = useRef<Set<string>>(new Set());
+
+  const norm = (a: string) => a.toLowerCase();
   // ----- Burner wallet -----
   const [burner, setBurner] = useState<ethers.Wallet | ethers.HDNodeWallet | null>(null);
   useEffect(() => {
@@ -161,6 +173,13 @@ export default function App() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [tile, setTile] = useState<number>(10);
+
+
+  function markSeen(id: string) {
+    lastSeenRef.current.set(id.toLowerCase(), Date.now());
+  }
+
+
 
   useEffect(() => {
     const el = containerRef.current;
@@ -206,36 +225,91 @@ export default function App() {
     setShowNameModal(!hasName);
   }, []);
 
+  useEffect(() => {
+    if (!hasSetName) return; // don’t kick until you’ve started playing
+
+    const interval = window.setInterval(async () => {
+      const now = Date.now();
+
+      for (const [id] of playersRef.current.entries()) {
+        const addr = id.toLowerCase();
+
+        // don't kick yourself
+        if (myId && addr === myId.toLowerCase()) continue;
+
+        const last = lastSeenRef.current.get(addr);
+        if (!last) continue;
+
+        // 15s timeout in contract; give a tiny buffer so we don’t spam reverts
+        if (now - last < 16_000) continue;
+
+        // avoid spamming kick calls from this client
+        if (kickInFlightRef.current.has(addr)) continue;
+        kickInFlightRef.current.add(addr);
+
+        try {
+          await fetch("/api/kick", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ player: id }),
+          });
+        } catch {
+          console.error("Failed to kick", id);
+          // ignore
+        } finally {
+          // allow retry later if still present
+          window.setTimeout(() => {
+            kickInFlightRef.current.delete(addr);
+          }, 3_000);
+        }
+      }
+    }, 3_000); // every 3 seconds
+
+    return () => window.clearInterval(interval);
+  }, [hasSetName, myId]);
+
   // --- event handlers (same shape as before) ---
   function onPlayerUpsert(id: PlayerId, player: Player) {
-    playersRef.current.set(id, player);
+    const key = norm(id);
+    playersRef.current.set(key, player);
+    markSeen(id);
     setPlayerCount(playersRef.current.size);
     if (myId && id.toLowerCase() === myId.toLowerCase()) setMyScore(player.score);
   }
 
   function onPlayerMoved(id: PlayerId, pos: { x: number; y: number }) {
-    const p = playersRef.current.get(id);
+    const key = norm(id);
+    const p = playersRef.current.get(key);
     if (!p) return;
     p.x = pos.x;
     p.y = pos.y;
     p.alive = true;
+    markSeen(id);
   }
 
   function onPlayerNamed(id: PlayerId, name: string) {
-    const p = playersRef.current.get(id);
+    const key = norm(id);
+    const p = playersRef.current.get(key);
     if (!p) return;
     p.name = name;
+    markSeen(id);
   }
 
   function onPlayerScore(id: PlayerId, score: number) {
-    const p = playersRef.current.get(id);
+    const key = norm(id);
+    const p = playersRef.current.get(key);
     if (!p) return;
     p.score = score;
     if (myId && id.toLowerCase() === myId.toLowerCase()) setMyScore(score);
   }
 
   function onKillFeedLine(text: string) {
-    setKillFeed((prev) => [{ text, ts: Date.now() }, ...prev].slice(0, 10));
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    setKillFeed((prev) => [{ id, text, ts: Date.now() }, ...prev].slice(0, 10));
   }
 
   // --- Chain connection (WS provider) ---
@@ -254,7 +328,7 @@ export default function App() {
     }
     if (!burner) return;
 
-    setMyId(burner.address);
+    setMyId(norm(burner.address));
     setStatus("Connecting to chain…");
 
     const provider = new ethers.WebSocketProvider(rpcWsUrl);
@@ -303,7 +377,7 @@ export default function App() {
         const args: any = parsed.args;
 
         if (ev === "Joined") {
-          const id = (args.player as string).toLowerCase();
+          const id = norm(args.player as string);
           const x = Number(args.x);
           const y = Number(args.y);
           const name = bytes12ToString(args.name);
@@ -312,7 +386,7 @@ export default function App() {
         }
 
         if (ev === "NameSet") {
-          const id = (args.player as string).toLowerCase();
+          const id = norm(args.player as string);
           const nm = bytes12ToString(args.name);
           // ensure player exists in map
           if (!playersRef.current.has(id)) {
@@ -324,7 +398,7 @@ export default function App() {
         }
 
         if (ev === "Moved") {
-          const id = (args.player as string).toLowerCase();
+          const id = norm(args.player as string);
           const toX = Number(args.toX);
           const toY = Number(args.toY);
 
@@ -337,12 +411,13 @@ export default function App() {
         }
 
         if (ev === "Killed") {
-          const killer = (args.killer as string).toLowerCase();
-          const victim = (args.victim as string).toLowerCase();
+          const killer = norm(args.killer as string);
+          const victim = norm(args.victim as string);
           const killerScore = Number(args.killerScore);
           const killerName = bytes12ToString(args.killerName);
           const victimName = bytes12ToString(args.victimName);
-
+          markSeen(killer);
+          markSeen(victim);
           // Update killer score + name
           if (!playersRef.current.has(killer)) {
             onPlayerUpsert(killer, { x: 0, y: 0, alive: true, score: killerScore, name: killerName });
@@ -361,7 +436,7 @@ export default function App() {
         }
 
         if (ev === "Respawned") {
-          const id = (args.player as string).toLowerCase();
+          const id = norm((args.player as string));
           const x = Number(args.x);
           const y = Number(args.y);
           const score = Number(args.score);
@@ -376,21 +451,69 @@ export default function App() {
           });
           return;
         }
+        if (ev === "Kicked") {
+          const player = norm(args.player as string);
+          console.log("kicked", player, "hasKey?", playersRef.current.has(player), "keysSample", [...playersRef.current.keys()].slice(0, 3));
+          playersRef.current.delete(player);
+          lastSeenRef.current.delete(player);
+          setPlayerCount(playersRef.current.size);
+
+          const nm = bytes12ToString(args.name as string) || shortAddr(player);
+          onKillFeedLine(`${nm} disconnected (inactive)`); // optional
+          return;
+        }
+
       } catch {
+        console.warn("failed to parse log", log);
         // ignore
       }
     };
 
     provider.on(filter, onLog);
+    async function backfill() {
+      const latest = await provider.getBlockNumber();
+      const fromBlock = Math.max(0, latest - 5000); // demo-safe range
+
+      const logs = await provider.getLogs({
+        address: arenaAddress as `0x${string}`,
+        fromBlock,
+        toBlock: latest,
+      });
+
+      logs.sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber)
+          return a.blockNumber - b.blockNumber;
+        if ((a.transactionIndex ?? 0) !== (b.transactionIndex ?? 0))
+          return (a.transactionIndex ?? 0) - (b.transactionIndex ?? 0);
+        return (a.index ?? 0) - (b.index ?? 0);
+      });
+
+      for (const l of logs) {
+        onLog(l);
+      }
+
+      setPlayerCount(playersRef.current.size);
+    }
+
+    backfill().catch(console.error);
+
+    setTimeout(async () => {
+      if (nameInput) await requestSetName(nameInput);
+      await requestJoin();
+    }, 0);
 
     return () => {
       alive = false;
       try {
         provider.off(filter, onLog);
-      } catch {}
+      } catch {
+        console.warn("Failed to clean up provider event listener");
+       }
       try {
         provider.destroy();
-      } catch {}
+      } catch {
+        console.warn("Failed to destroy provider");
+       }
       providerRef.current = null;
       arenaRef.current = null;
       chainIdRef.current = null;
@@ -426,7 +549,9 @@ export default function App() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ player, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
-    }).catch(() => {});
+    }).catch(() => {
+      console.error("Failed to join");
+     });
   }
 
   async function requestSetName(name: string) {
@@ -446,52 +571,54 @@ export default function App() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ player, name, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
-    }).catch(() => {});
+    }).catch(() => { 
+      console.error("Failed to set name");
+    });
   }
 
- async function requestMove(dir: 0 | 1 | 2 | 3) {
-  if (!hasSetName) return;
-  if (!burner) return;
+  async function requestMove(dir: 0 | 1 | 2 | 3) {
+    if (!hasSetName) return;
+    if (!burner) return;
 
-  // coalesce spam: keep only latest direction
-  pendingDirRef.current = dir;
+    // coalesce spam: keep only latest direction
+    pendingDirRef.current = dir;
 
-  // if a move is already being sent, just wait — latest dir will be sent next
-  if (moveInFlightRef.current) return;
+    // if a move is already being sent, just wait — latest dir will be sent next
+    if (moveInFlightRef.current) return;
 
-  moveInFlightRef.current = true;
-  try {
-    while (pendingDirRef.current !== null) {
-      const d = pendingDirRef.current;
-      pendingDirRef.current = null;
+    moveInFlightRef.current = true;
+    try {
+      while (pendingDirRef.current !== null) {
+        const d = pendingDirRef.current;
+        pendingDirRef.current = null;
 
-      const chainId = chainIdRef.current;
-      if (!chainId) return;
+        const chainId = chainIdRef.current;
+        if (!chainId) return;
 
-      const player = burner.address;
-      const nonce = await getNonce(player);
-      const deadline = BigInt(0);
+        const player = burner.address;
+        const nonce = await getNonce(player);
+        const deadline = BigInt(0);
 
-      const dig = digestMove({ chainId, arenaAddress, player, dir: d, nonce, deadline });
-      const sig = await signDigest(dig);
+        const dig = digestMove({ chainId, arenaAddress, player, dir: d, nonce, deadline });
+        const sig = await signDigest(dig);
 
-      const res = await fetch("/api/move", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ player, dir: d, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
-      });
+        const res = await fetch("/api/move", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ player, dir: d, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
+        });
 
-      // if relayer rejected, stop the loop (prevents infinite retries)
-      if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
-        console.warn("move rejected", j);
-        return;
+        // if relayer rejected, stop the loop (prevents infinite retries)
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          console.warn("move rejected", j);
+          return;
+        }
       }
+    } finally {
+      moveInFlightRef.current = false;
     }
-  } finally {
-    moveInFlightRef.current = false;
   }
-}
 
   // keyboard support
   useEffect(() => {
@@ -751,7 +878,7 @@ export default function App() {
             <div style={{ fontWeight: 800, marginBottom: 8 }}>Kill feed</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {killFeed.map((k) => (
-                <div key={k.ts} style={{ opacity: 0.85, fontSize: 13 }}>
+                <div key={k.id} style={{ opacity: 0.85, fontSize: 13 }}>
                   {k.text}
                 </div>
               ))}
