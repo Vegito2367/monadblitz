@@ -4,7 +4,7 @@ import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ethers } from "ethers";
 
-const MAP_SIZE = 32;
+const MAP_SIZE = 24;
 
 type PlayerId = string;
 type Player = { x: number; y: number; alive: boolean; score: number; name: string };
@@ -637,30 +637,6 @@ export default function App() {
   const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const SWIPE_MIN_PX = coarse ? 18 : 12;
 
-  const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!hasSetName) return;
-    (e.currentTarget as HTMLCanvasElement).setPointerCapture?.(e.pointerId);
-    pointerStartRef.current = { x: e.clientX, y: e.clientY };
-  };
-
-  const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!hasSetName) return;
-    const start = pointerStartRef.current;
-    pointerStartRef.current = null;
-    if (!start) return;
-
-    const dx = e.clientX - start.x;
-    const dy = e.clientY - start.y;
-
-    const adx = Math.abs(dx);
-    const ady = Math.abs(dy);
-
-    if (adx < SWIPE_MIN_PX && ady < SWIPE_MIN_PX) return;
-
-    if (adx > ady) requestMove(dx > 0 ? 3 : 2);
-    else requestMove(dy > 0 ? 1 : 0);
-  };
-
   // leaderboard refresh loop
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -894,15 +870,12 @@ export default function App() {
             <canvas
               ref={canvasRef}
               aria-label="Arena"
-              onPointerDown={onPointerDown}
-              onPointerUp={onPointerUp}
               style={{
                 width: arenaPx,
                 height: arenaPx,
                 borderRadius: 14,
                 background: "rgba(0,0,0,0.28)",
                 boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
-                touchAction: "none",
                 opacity: hasSetName ? 1 : 0.5,
               }}
             />
