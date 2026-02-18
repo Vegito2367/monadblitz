@@ -10,7 +10,7 @@ contract Arena {
     using ECDSA for bytes32;
 
     // ---------- Config ----------
-    uint8 public constant MAP_SIZE = 32;
+    uint8 public constant MAP_SIZE = 24;
 
     // ---------- Storage ----------
     struct Player {
