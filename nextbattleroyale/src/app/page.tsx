@@ -4,7 +4,7 @@ import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ethers } from "ethers";
 
-const MAP_SIZE = 64;
+const MAP_SIZE = 32;
 
 type PlayerId = string;
 type Player = { x: number; y: number; alive: boolean; score: number; name: string };
