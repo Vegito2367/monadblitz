@@ -25,7 +25,6 @@ const ARENA_ABI = [
   "function nonces(address) view returns (uint256)",
   "function joinFor(address player,uint256 nonce,uint256 deadline,bytes sig)",
   "function moveFor(address player,uint8 dir,uint256 nonce,uint256 deadline,bytes sig)",
-  "function setNameFor(address player,bytes12 newName,uint256 nonce,uint256deadline,bytes sig)",
   "function setNameFor(address player,bytes12 newName,uint256 nonce,uint256 deadline,bytes sig)",
   "function kickInactive(address player)",
 ] as const;
@@ -106,7 +105,7 @@ const wallet = new ethers.Wallet(RELAYER_PRIVATE_KEY, provider);
 
 // NonceManager prevents nonce races inside this single process
 const signer = new ethers.NonceManager(wallet);
-const arena = new ethers.Contract(ARENA_ADDRESS, ARENA_ABI, signer);
+const arena = new ethers.Contract(ARENA_ADDRESS, ARENA_ABI, signer) as any;
 
 // ---- single FIFO queue for all txs ----
 let tail = Promise.resolve();
