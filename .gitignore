@@ -14,3 +14,5 @@ docs/
 .env
 arenacontracts/lib/**
 
+relayer/node_modules/**
+

@@ -155,6 +155,16 @@ function digestSetName(params: {
 // ------------------------------------------------------------------------
 
 export default function App() {
+
+  const myConfirmedRef = useRef<{ x: number; y: number } | null>(null);
+const myOptimisticRef = useRef<{ x: number; y: number } | null>(null);
+
+function applyDirLocal(x: number, y: number, dir: 0|1|2|3) {
+  if (dir === 0) return { x, y: y === 0 ? 0 : y - 1 };
+  if (dir === 1) return { x, y: y === 63 ? 63 : y + 1 };
+  if (dir === 2) return { x: x === 0 ? 0 : x - 1, y };
+  return { x: x === 63 ? 63 : x + 1, y };
+}
   const coarse = useIsCoarsePointer();
   const moveInFlightRef = useRef(false);
   const pendingDirRef = useRef<0 | 1 | 2 | 3 | null>(null);
@@ -248,7 +258,7 @@ export default function App() {
         kickInFlightRef.current.add(addr);
 
         try {
-          await fetch("/api/kick", {
+          await fetch(`${process.env.NEXT_PUBLIC_RELAYER_URL}/kick`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ player: id }),
@@ -377,13 +387,19 @@ export default function App() {
         const args: any = parsed.args;
 
         if (ev === "Joined") {
-          const id = norm(args.player as string);
-          const x = Number(args.x);
-          const y = Number(args.y);
-          const name = bytes12ToString(args.name);
-          onPlayerUpsert(id, { x, y, alive: true, score: 0, name });
-          return;
-        }
+  const id = norm(args.player as string);
+  const x = Number(args.x);
+  const y = Number(args.y);
+  const name = bytes12ToString(args.name);
+
+  onPlayerUpsert(id, { x, y, alive: true, score: 0, name });
+
+  if (myId && id === myId.toLowerCase()) {
+    myConfirmedRef.current = { x, y };
+    myOptimisticRef.current = null;
+  }
+  return;
+}
 
         if (ev === "NameSet") {
           const id = norm(args.player as string);
@@ -398,17 +414,22 @@ export default function App() {
         }
 
         if (ev === "Moved") {
-          const id = norm(args.player as string);
-          const toX = Number(args.toX);
-          const toY = Number(args.toY);
+  const id = norm(args.player as string);
+  const toX = Number(args.toX);
+  const toY = Number(args.toY);
 
-          if (!playersRef.current.has(id)) {
-            onPlayerUpsert(id, { x: toX, y: toY, alive: true, score: 0, name: "" });
-          } else {
-            onPlayerMoved(id, { x: toX, y: toY });
-          }
-          return;
-        }
+  if (!playersRef.current.has(id)) {
+    onPlayerUpsert(id, { x: toX, y: toY, alive: true, score: 0, name: "" });
+  } else {
+    onPlayerMoved(id, { x: toX, y: toY });
+  }
+
+  if (myId && id === myId.toLowerCase()) {
+    myConfirmedRef.current = { x: toX, y: toY };
+    myOptimisticRef.current = null; // chain caught up
+  }
+  return;
+}
 
         if (ev === "Killed") {
           const killer = norm(args.killer as string);
@@ -452,16 +473,17 @@ export default function App() {
           return;
         }
         if (ev === "Kicked") {
-          const player = norm(args.player as string);
-          console.log("kicked", player, "hasKey?", playersRef.current.has(player), "keysSample", [...playersRef.current.keys()].slice(0, 3));
-          playersRef.current.delete(player);
-          lastSeenRef.current.delete(player);
-          setPlayerCount(playersRef.current.size);
+  const player = norm(args.player as string);
+  playersRef.current.delete(player);
+  lastSeenRef.current.delete(player);
+  setPlayerCount(playersRef.current.size);
 
-          const nm = bytes12ToString(args.name as string) || shortAddr(player);
-          onKillFeedLine(`${nm} disconnected (inactive)`); // optional
-          return;
-        }
+  if (myId && player === myId.toLowerCase()) {
+    myConfirmedRef.current = null;
+    myOptimisticRef.current = null;
+  }
+  return;
+}
 
       } catch {
         console.warn("failed to parse log", log);
@@ -472,7 +494,7 @@ export default function App() {
     provider.on(filter, onLog);
     async function backfill() {
       const latest = await provider.getBlockNumber();
-      const fromBlock = Math.max(0, latest - 5000); // demo-safe range
+      const fromBlock = Math.max(0, latest - 5); // demo-safe range
 
       const logs = await provider.getLogs({
         address: arenaAddress as `0x${string}`,
@@ -545,7 +567,7 @@ export default function App() {
     const dig = digestJoin({ chainId, arenaAddress, player, nonce, deadline });
     const sig = await signDigest(dig);
 
-    await fetch("/api/join", {
+    await fetch(`${process.env.NEXT_PUBLIC_RELAYER_URL}/join`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ player, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
@@ -567,7 +589,7 @@ export default function App() {
     const dig = digestSetName({ chainId, arenaAddress, player, nameBytes12, nonce, deadline });
     const sig = await signDigest(dig);
 
-    await fetch("/api/set-name", {
+    await fetch(`${process.env.NEXT_PUBLIC_RELAYER_URL}/set-name`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ player, name, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
@@ -579,6 +601,16 @@ export default function App() {
   async function requestMove(dir: 0 | 1 | 2 | 3) {
     if (!hasSetName) return;
     if (!burner) return;
+    const me = burner.address.toLowerCase();
+const p = playersRef.current.get(me);
+if (p) {
+  const next = applyDirLocal(p.x, p.y, dir);
+  p.x = next.x;
+  p.y = next.y;
+  p.alive = true;
+
+  myOptimisticRef.current = { x: next.x, y: next.y };
+}
 
     // coalesce spam: keep only latest direction
     pendingDirRef.current = dir;
@@ -602,7 +634,7 @@ export default function App() {
         const dig = digestMove({ chainId, arenaAddress, player, dir: d, nonce, deadline });
         const sig = await signDigest(dig);
 
-        const res = await fetch("/api/move", {
+        const res = await fetch(`${process.env.NEXT_PUBLIC_RELAYER_URL}/move`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ player, dir: d, nonce: nonce.toString(), deadline: deadline.toString(), sig }),
